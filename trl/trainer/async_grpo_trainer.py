@@ -199,7 +199,7 @@ class TreeRow:
                 - `tree_cu_seqlens_q` (`S + 1`), `tree_cu_seqlens_k` (`S + 1`): segment boundaries in the row, path
                   boundaries in `tree_kv_index`.
                 - `tree_segment_parents` (`S`), `tree_segment_depths` (`S`): the segment tree, for the recurrent layers
-                  patched by [`patch_tree_gdn`].
+                  patched by [`patch_tree_gdn`] and [`patch_tree_mamba2`].
                 - `tree_sizes` (`4 + depth`): longest segment, longest path, `K`, 64-token chunks, then the segments
                   per depth. Every length the kernels launch with, so a rank reads them in one go (see [`unpad_tree`]).
                 - `token_index` (`M`): position whose prediction is each trained token. A shared position serves every
@@ -402,6 +402,51 @@ def patch_tree_gdn(model) -> bool:
         return tree_chunk_gated_delta_rule(query, key, value, g, beta, kwargs, use_qk_l2norm_in_kernel), None
 
     modeling.causal_conv1d_fn, modeling.torch_chunk_gated_delta_rule = causal_conv1d_fn, torch_chunk_gated_delta_rule
+    _PATCHED.add(modeling)
+    return True
+
+
+def patch_tree_mamba2(model) -> bool:
+    """
+    Make the model's Mamba2 layers follow the tree of a tree-packed forward.
+
+    Transformers' Nemotron-H runs these layers through two module-level functions, `causal_conv1d_fn` and
+    `mamba2_chunk_scan`, and passes the forward's keyword arguments down to both. Both are wrapped as in
+    [`patch_tree_gdn`]. The fused `mamba2_split_conv1d_scan_combined` they try first in training is wrapped too: on a
+    tree it returns `None`, which sends them down the unfused path.
+
+    Returns:
+        `bool`: whether the model's modeling module has those functions.
+    """
+    modeling = sys.modules[type(model).forward.__module__]
+    conv, scan = vars(modeling).get("causal_conv1d_fn"), vars(modeling).get("mamba2_chunk_scan")
+    fused = vars(modeling).get("mamba2_split_conv1d_scan_combined")
+    if conv is None or scan is None or fused is None:
+        return False
+    if modeling in _PATCHED:
+        return True
+    from ..kernels.tree_gated_delta_rule import tree_causal_conv1d
+    from ..kernels.tree_mamba2 import tree_mamba2_chunk_scan
+
+    def causal_conv1d_fn(hidden_states, weight, bias=None, activation=None, **kwargs):
+        if "tree_segment_parents" not in kwargs:
+            return conv(hidden_states, weight, bias, activation=activation, **kwargs)
+        return tree_causal_conv1d(hidden_states, weight, bias, activation, kwargs, conv)
+
+    def mamba2_chunk_scan(
+        hidden_states, dt, A, B, C, chunk_size, D=None, dt_bias=None, dt_limit=(0.0, math.inf), **kwargs
+    ):
+        if "tree_segment_parents" not in kwargs:
+            return scan(hidden_states, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_limit=dt_limit, **kwargs)
+        return tree_mamba2_chunk_scan(hidden_states, dt, A, B, C, D, dt_bias, dt_limit, kwargs)
+
+    def mamba2_split_conv1d_scan_combined(*args, **kwargs):
+        if "tree_segment_parents" not in kwargs:
+            return fused(*args, **kwargs)
+        return None
+
+    modeling.causal_conv1d_fn, modeling.mamba2_chunk_scan = causal_conv1d_fn, mamba2_chunk_scan
+    modeling.mamba2_split_conv1d_scan_combined = mamba2_split_conv1d_scan_combined
     _PATCHED.add(modeling)
     return True
 
@@ -3012,20 +3057,25 @@ class AsyncGRPOTrainer(_BaseTrainer):
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")
 
         text_config = model.config.get_text_config()
-        layer_types = set(getattr(text_config, "layer_types", None) or []) - {"full_attention", "sliding_attention"}
+        layer_types = set(getattr(text_config, "layer_types", None) or []) - {
+            "full_attention",
+            "sliding_attention",
+            "moe",
+            "mlp",
+        }
         # Check tree attention compat
         if layer_types:
             if layer_types == {"linear_attention"} and Version(transformers.__version__) < Version("5.15.0"):
                 raise ValueError(
-                    f"Tree packing of {type(model).__name__}'s gated DeltaNet layers requires transformers>=5.15.0: "
-                    "before it, these layers call the functions they stored at init rather than the module-level "
-                    "ones tree packing patches, so they would scan across samples."
+                    f"Tree packing of {type(model).__name__}'s linear attention layers requires "
+                    "transformers>=5.15.0: before it, these layers do not call the module-level functions tree "
+                    "packing patches, so they would scan across samples."
                 )
-            if layer_types != {"linear_attention"} or not patch_tree_gdn(model):
+            if layer_types != {"linear_attention"} or not (patch_tree_gdn(model) or patch_tree_mamba2(model)):
                 raise ValueError(
                     f"{type(model).__name__} has {sorted(layer_types)} layers. Tree packing routes attention and "
-                    "transformers' gated DeltaNet layers along each sample's own path; any other recurrent or "
-                    "convolutional layer would scan across samples."
+                    "transformers' gated DeltaNet and Mamba2 layers along each sample's own path; any other recurrent "
+                    "or convolutional layer would scan across samples."
                 )
         if any(name.endswith(".sinks") for name, _ in model.named_parameters()):
             raise ValueError(

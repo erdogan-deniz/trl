@@ -1011,12 +1011,7 @@ class TestAsyncGRPOTrainer(TrlTestCase):
                     "within 20 minutes"
                 ),
             ),
-            pytest.param(
-                "trl-internal-testing/tiny-NemotronHForCausalLM-nano",
-                marks=pytest.mark.xfail(
-                    raises=ValueError, reason="Mamba layers are not supported (#8233)", strict=True
-                ),
-            ),
+            "trl-internal-testing/tiny-NemotronHForCausalLM-nano",
         ],
     )
     def test_train(self, model_id, make_vllm_server):
@@ -4336,6 +4331,7 @@ _VLM_TEXT_HEAD_DIM_4 = pytest.mark.xfail(
         pytest.param("trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-Think", {}, id="qwen35-gdn"),
         pytest.param("trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-3.8", {}, id="qwen38-gdn"),
         pytest.param("trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6", {}, id="qwen36-moe-gdn"),
+        pytest.param("trl-internal-testing/tiny-NemotronHForCausalLM-nano", {}, id="nemotron-h-mamba2"),
         pytest.param("trl-internal-testing/tiny-Qwen2VLForConditionalGeneration", {}, id="qwen2-vl"),
         pytest.param("trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration", {}, id="qwen25-vl"),
         pytest.param("trl-internal-testing/tiny-LlamaForCausalLM-3.1", {}, id="llama31"),
@@ -4474,7 +4470,6 @@ class TestTreePackingRefusesUnsupportedModels(TrlTestCase):
         ("model_id", "match"),
         [
             pytest.param("trl-internal-testing/tiny-Lfm2ForCausalLM", "conv", id="lfm2"),
-            pytest.param("trl-internal-testing/tiny-NemotronHForCausalLM-nano", "linear_attention", id="nemotron-h"),
             pytest.param("trl-internal-testing/tiny-FalconMambaForCausalLM", "linear_attention", id="falcon-mamba"),
             pytest.param("trl-internal-testing/tiny-GptOssForCausalLM", "attention sinks", id="gpt-oss"),
         ],
