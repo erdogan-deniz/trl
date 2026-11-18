@@ -83,14 +83,20 @@ def tree_plan(tree):
     }
 
 
-def tree_chunk_gated_delta_rule(q, k, v, g, beta, tree, use_qk_l2norm_in_kernel):
-    """Gated delta rule over a packed tree: `(1, tokens, heads, dim)` inputs, `(1, tokens, heads)` gates."""
-    return TreeGatedDeltaRule.apply(q, k, v, g, beta, tree_plan(tree), q.shape[-1] ** -0.5, use_qk_l2norm_in_kernel)
-
-
-def tree_causal_conv1d(hidden_states, weight, bias, activation, tree, conv):
+def tree_chunk_gated_delta_rule(chunk, query, key, value, g, beta, use_qk_l2norm_in_kernel=False, **tree):
     """
-    Causal convolution over a packed tree `(1, channels, tokens)`, run by the model's own `conv`.
+    Tree version of transformers' `torch_chunk_gated_delta_rule` (`chunk`, unused): `(1, tokens, heads, dim)` inputs,
+    `(1, tokens, heads)` gates.
+    """
+    scale = query.shape[-1] ** -0.5
+    plan = tree_plan(tree)
+    return TreeGatedDeltaRule.apply(query, key, value, g, beta, plan, scale, use_qk_l2norm_in_kernel), None
+
+
+def tree_causal_conv1d(conv, hidden_states, weight, bias=None, activation=None, **tree):
+    """
+    Tree version of transformers' `causal_conv1d_fn`: causal convolution over a packed tree `(1, channels, tokens)`,
+    run by the model's own `conv`.
 
     Each segment is preceded by the `kernel_size - 1` tokens before it on its root path, so every window reads the
     sample's own history; the outputs at those inserted positions are dropped.
@@ -323,6 +329,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     b_h1 = tl.zeros([64, BV], dtype=tl.float32)
     if K > 64:
         b_h2 = tl.zeros([64, BV], dtype=tl.float32)
+    if K > 128:
+        b_h3 = tl.zeros([64, BV], dtype=tl.float32)
+    if K > 192:
+        b_h4 = tl.zeros([64, BV], dtype=tl.float32)
 
     # calculate offset
     h += (boh * HV + i_h).to(tl.int64) * K * V
@@ -343,6 +353,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     m_k1 = o_k1 < K
     o_k2 = 64 + o_k1
     m_k2 = o_k2 < K
+    o_k3 = 128 + o_k1
+    m_k3 = o_k3 < K
+    o_k4 = 192 + o_k1
+    m_k4 = o_k4 < K
     if parent >= 0:
         p_h0_1 = h0 + o_k1[:, None] * V + o_v[None, :]
         m_h0_1 = m_k1[:, None] & m_v[None, :]
@@ -351,6 +365,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_h0_2 = h0 + o_k2[:, None] * V + o_v[None, :]
             m_h0_2 = m_k2[:, None] & m_v[None, :]
             b_h2 += tl.load(p_h0_2, mask=m_h0_2, other=0.0).to(tl.float32)
+        if K > 128:
+            p_h0_3 = h0 + o_k3[:, None] * V + o_v[None, :]
+            m_h0_3 = m_k3[:, None] & m_v[None, :]
+            b_h3 += tl.load(p_h0_3, mask=m_h0_3, other=0.0).to(tl.float32)
+        if K > 192:
+            p_h0_4 = h0 + o_k4[:, None] * V + o_v[None, :]
+            m_h0_4 = m_k4[:, None] & m_v[None, :]
+            b_h4 += tl.load(p_h0_4, mask=m_h0_4, other=0.0).to(tl.float32)
 
     # main recurrence
     for i_t in range(NT):
@@ -364,6 +386,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_h2 = h + i_t_int64 * HV * K * V + o_k2[:, None] * V + o_v[None, :]
             m_h2 = m_k2[:, None] & m_v[None, :]
             tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), mask=m_h2)
+        if K > 128:
+            p_h3 = h + i_t_int64 * HV * K * V + o_k3[:, None] * V + o_v[None, :]
+            m_h3 = m_k3[:, None] & m_v[None, :]
+            tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), mask=m_h3)
+        if K > 192:
+            p_h4 = h + i_t_int64 * HV * K * V + o_k4[:, None] * V + o_v[None, :]
+            m_h4 = m_k4[:, None] & m_v[None, :]
+            tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), mask=m_h4)
 
         if USE_W:
             p_w = w + o_t[:, None] * (HV * K) + o_k1[None, :]
@@ -373,6 +403,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 p_w = w + o_t[:, None] * (HV * K) + o_k2[None, :]
                 b_w = tl.load(p_w, mask=m_t[:, None] & m_k2[None, :], other=0.0)
                 b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
+            if K > 128:
+                p_w = w + o_t[:, None] * (HV * K) + o_k3[None, :]
+                b_w = tl.load(p_w, mask=m_t[:, None] & m_k3[None, :], other=0.0)
+                b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
+            if K > 192:
+                p_w = w + o_t[:, None] * (HV * K) + o_k4[None, :]
+                b_w = tl.load(p_w, mask=m_t[:, None] & m_k4[None, :], other=0.0)
+                b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
             p_v = v + o_t[:, None] * (HV * V) + o_v[None, :]
             b_v = tl.load(p_v, mask=m_t[:, None] & m_v[None, :], other=0.0) - b_v
 
@@ -391,6 +429,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_h1 *= b_g_last
         if K > 64:
             b_h2 *= b_g_last
+        if K > 128:
+            b_h3 *= b_g_last
+        if K > 192:
+            b_h4 *= b_g_last
 
         b_v = b_v.to(k.dtype.element_ty)
 
@@ -401,6 +443,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_k = k + o_k2[:, None] + o_t[None, :] * (H * K)
             b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
             b_h2 += tl.dot(b_k, b_v)
+        if K > 128:
+            p_k = k + o_k3[:, None] + o_t[None, :] * (H * K)
+            b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+            b_h3 += tl.dot(b_k, b_v)
+        if K > 192:
+            p_k = k + o_k4[:, None] + o_t[None, :] * (H * K)
+            b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+            b_h4 += tl.dot(b_k, b_v)
 
     p_ht = ht + o_k1[:, None] * V + o_v[None, :]
     m_ht = m_k1[:, None] & m_v[None, :]
@@ -409,6 +459,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         p_ht = ht + o_k2[:, None] * V + o_v[None, :]
         m_ht = m_k2[:, None] & m_v[None, :]
         tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), mask=m_ht)
+    if K > 128:
+        p_ht = ht + o_k3[:, None] * V + o_v[None, :]
+        m_ht = m_k3[:, None] & m_v[None, :]
+        tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), mask=m_ht)
+    if K > 192:
+        p_ht = ht + o_k4[:, None] * V + o_v[None, :]
+        m_ht = m_k4[:, None] & m_v[None, :]
+        tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_ht)
 
 
 @triton.autotune(
@@ -458,6 +516,10 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     b_dh1 = tl.zeros([64, BV], dtype=tl.float32)
     if K > 64:
         b_dh2 = tl.zeros([64, BV], dtype=tl.float32)
+    if K > 128:
+        b_dh3 = tl.zeros([64, BV], dtype=tl.float32)
+    if K > 192:
+        b_dh4 = tl.zeros([64, BV], dtype=tl.float32)
 
     # calculate offset
     q += (bos * H + i_h // (HV // H)).to(tl.int64) * K
@@ -478,6 +540,10 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     m_k1 = o_k1 < K
     o_k2 = 64 + o_k1
     m_k2 = o_k2 < K
+    o_k3 = 128 + o_k1
+    m_k3 = o_k3 < K
+    o_k4 = 192 + o_k1
+    m_k4 = o_k4 < K
     # Tree boundary: sum child input-state gradients before scanning this segment backward.
     first = tl.load(child_offsets + i_n)
     last = tl.load(child_offsets + i_n + 1)
@@ -491,6 +557,14 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             p_dht2 = dht + o_k2[:, None] * V + o_v[None, :]
             m_dht2 = m_k2[:, None] & m_v[None, :]
             b_dh2 += tl.load(p_dht2, mask=m_dht2, other=0.0)
+        if K > 128:
+            p_dht3 = dht + o_k3[:, None] * V + o_v[None, :]
+            m_dht3 = m_k3[:, None] & m_v[None, :]
+            b_dh3 += tl.load(p_dht3, mask=m_dht3, other=0.0)
+        if K > 192:
+            p_dht4 = dht + o_k4[:, None] * V + o_v[None, :]
+            m_dht4 = m_k4[:, None] & m_v[None, :]
+            b_dh4 += tl.load(p_dht4, mask=m_dht4, other=0.0)
 
     for i_t in range(NT - 1, -1, -1):
         i_t_int64 = i_t.to(tl.int64)
@@ -503,6 +577,14 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             p_dh2 = dh + i_t_int64 * HV * K * V + o_k2[:, None] * V + o_v[None, :]
             m_dh2 = m_k2[:, None] & m_v[None, :]
             tl.store(p_dh2, b_dh2.to(p_dh2.dtype.element_ty), mask=m_dh2)
+        if K > 128:
+            p_dh3 = dh + i_t_int64 * HV * K * V + o_k3[:, None] * V + o_v[None, :]
+            m_dh3 = m_k3[:, None] & m_v[None, :]
+            tl.store(p_dh3, b_dh3.to(p_dh3.dtype.element_ty), mask=m_dh3)
+        if K > 192:
+            p_dh4 = dh + i_t_int64 * HV * K * V + o_k4[:, None] * V + o_v[None, :]
+            m_dh4 = m_k4[:, None] & m_v[None, :]
+            tl.store(p_dh4, b_dh4.to(p_dh4.dtype.element_ty), mask=m_dh4)
 
         last_idx = min((i_t + 1) * BT, T) - 1
         bg_last = tl.load(g + (bos + last_idx) * HV + i_h).to(tl.float32)
@@ -525,6 +607,14 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             p_k = k + o_t[:, None] * (H * K) + o_k2[None, :]
             b_k = tl.load(p_k, mask=m_t[:, None] & m_k2[None, :], other=0.0)
             b_dv += tl.dot(b_k, b_dh2.to(b_k.dtype))
+        if K > 128:
+            p_k = k + o_t[:, None] * (H * K) + o_k3[None, :]
+            b_k = tl.load(p_k, mask=m_t[:, None] & m_k3[None, :], other=0.0)
+            b_dv += tl.dot(b_k, b_dh3.to(b_k.dtype))
+        if K > 192:
+            p_k = k + o_t[:, None] * (H * K) + o_k4[None, :]
+            b_k = tl.load(p_k, mask=m_t[:, None] & m_k4[None, :], other=0.0)
+            b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
 
         b_dv *= tl.where(m_t, exp2(bg_last - b_g), 0)[:, None]
         b_dv += tl.load(p_dv, mask=m_t[:, None] & m_v[None, :], other=0.0)
@@ -554,6 +644,30 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 b_dh2 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
             else:
                 b_dh2 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale
+        if K > 128:
+            p_q = q + o_k3[:, None] + o_t[None, :] * (H * K)
+            b_q = tl.load(p_q, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+            if USE_W:
+                p_w = w + o_k3[:, None] + o_t[None, :] * (HV * K)
+                b_w = tl.load(p_w, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+            b_dh3 *= bg_last_exp
+            b_q = b_q * b_g_exp[None, :]
+            if USE_W:
+                b_dh3 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
+            else:
+                b_dh3 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale
+        if K > 192:
+            p_q = q + o_k4[:, None] + o_t[None, :] * (H * K)
+            b_q = tl.load(p_q, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+            if USE_W:
+                p_w = w + o_k4[:, None] + o_t[None, :] * (HV * K)
+                b_w = tl.load(p_w, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+            b_dh4 *= bg_last_exp
+            b_q = b_q * b_g_exp[None, :]
+            if USE_W:
+                b_dh4 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
+            else:
+                b_dh4 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale
 
     p_dh0 = dh0 + o_k1[:, None] * V + o_v[None, :]
     m_dh0 = m_k1[:, None] & m_v[None, :]
@@ -562,6 +676,14 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         p_dh1 = dh0 + o_k2[:, None] * V + o_v[None, :]
         m_dh1 = m_k2[:, None] & m_v[None, :]
         tl.store(p_dh1, b_dh2.to(p_dh1.dtype.element_ty), mask=m_dh1)
+    if K > 128:
+        p_dh1 = dh0 + o_k3[:, None] * V + o_v[None, :]
+        m_dh1 = m_k3[:, None] & m_v[None, :]
+        tl.store(p_dh1, b_dh3.to(p_dh1.dtype.element_ty), mask=m_dh1)
+    if K > 192:
+        p_dh1 = dh0 + o_k4[:, None] * V + o_v[None, :]
+        m_dh1 = m_k4[:, None] & m_v[None, :]
+        tl.store(p_dh1, b_dh4.to(p_dh1.dtype.element_ty), mask=m_dh1)
 
 
 # --- Fused 64-token Gram matrix and triangular solve ---
